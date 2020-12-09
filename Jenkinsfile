@@ -1,104 +1,94 @@
-#!groovy
-@Library('eqx-shared-libraries')
-
-String version
-String awsRegion = "us-east-1"
-String appName = "hypergate-assessment"
-String dockerFilePath = "."
-String TASK_FAMILY = "assessment"
-#String projectFile = "pom.xml"
-String env = env.BRANCH_NAME
-String ecrRepo =  ""
-String awsAccount= "520009515406"
-
-
-
 pipeline {
-    agent none
-
-    options {
-        buildDiscarder(logRotator(numToKeepStr: '30'))
-        disableConcurrentBuilds()
-        timeout(time: 6, unit: 'HOURS')
-        ansiColor('xterm')
+    environment {
+        VERSION = "latest"
+        PROJECT = "workshop"
+        IMAGE = "$PROJECT:$VERSION"
+        ECRURL = 'https://683294139580.dkr.ecr.ap-south-1.amazonaws.com/workshop'
+        ECRCRED = "ecr:ap-south-1:c8880065-79a9-4e1b-b329-aafbb2ce4f00"
     }
-
+       
+    agent any
+    tools {
+        maven 'maven'
+    }
+	
     stages {
-        stage('Spot Poc Version Build') {
-            agent { label 'linux' }
-            tools {
-                maven 'maven-3.5.0'
+        stage ('Initialize') {
+            steps {
+                sh '''
+                    echo "PATH = ${PATH}"
+                    echo "M2_HOME = ${M2_HOME}/bin/mvn"
+                '''
             }
+        }
+       
+        stage('SCM Checkout') {
+            steps {
+            // Get source code from Gitlab repository
+                checkout([$class: 'GitSCM', branches: [[name: '*/dev']], doGenerateSubmoduleConfigurations: false, extensions: [[$class: 'RelativeTargetDirectory', relativeTargetDir: '']], submoduleCfg: [], userRemoteConfigs: [[credentialsId: 'github_cred', url: 'https://github.com/shareef-mt/hackathan-mt.git']]])
+            }
+        }
+       
+        stage('Mvn Package') {
+            steps {
+                sh 'mvn -B -DskipTests clean package -e'
+            }
+        }
+       
+        stage('Docker Image Build') {
+            steps {
+            sh '''
+                    pwd
+                    echo "PATH = ${PATH}"
+                    echo "PATH = ${IMAGE}"
+                '''
+                script {
+                    sh 'docker version '
+                    docker.build('$IMAGE')
+                }
+            }
+        }
+        
+		stage('Aws Ecr Repo Creation') {
+			steps {
+				dir("ecr/") {
+					script {
+						sh  '''
+								terraform init
+								terraform plan
+								terraform apply
+							'''
+					}
+				}
+			}
+		}
+        stage('Scanning & Pushing Docker Image into Aws Repo') {
             steps {
                 script {
-                    version = VersionNumber(
-                        versionNumberString: '1.1.${BUILD_NUMBER, X}',
-                        skipFailedBuilds:    false)
-                    currentBuild.displayName = version
-                    println "Pipeline Version='${version}'"
-                }
-                dir("${WORKSPACE}") {
-                      withCredentials([usernamePassword(credentialsId: 'coaching-maven', passwordVariable: 'PASSWORD_VAR', usernameVariable: 'USERNAME_VAR')])    {
-                           sh "find . -type f -name pom.xml | xargs sed -i 's/0.0.0/'${version}'/g'"
-		                   mavenBuild(version, appName, env, projectFile)
+                    docker.withRegistry(ECRURL, ECRCRED)
+                        {
+                            sh 'aws ecr put-image-scanning-configuration --repository-name workshop --image-scanning-configuration scanOnPush=true --region ap-south-1'
+                            docker.image(IMAGE).push()
+                 
                         }
-                   }
-               }
-           }
-
-//		stage('Spot Poc Code Analytics') {
-//            when {
-//                anyOf { branch 'DOPS-2931' }
-//            }
-//            agent { label 'linux-maven' }
-//            tools {
-//               maven 'maven-3.5.0'
-//            }
-//            environment{
-//               SONAR_SCANNER_OPTS="-Xmx512m"
-//            }
-//            steps {
-//                dir("${WORKSPACE}") {
-//                   unstash name: "${appName}-build-output-${env}"
-//                   withSonarQubeEnv('Sonarqube') {
-//                      withCredentials([usernamePassword(credentialsId: 'coaching-maven', passwordVariable: 'PASSWORD_VAR', usernameVariable: 'USERNAME_VAR')])    {
-//                           sh "mvn clean test org.jacoco:jacoco-maven-plugin:prepare-agent install -Dmaven.test.failure.ignore=false"
-//		                   sh "mvn -e -B sonar:sonar -Dsonar.java.source=1.8 -Dsonar.host.url='https://coachingsonar.equinoxfitness.com'"
-//                        }
-//                    }
-//                 }
-//            }
-//        }
-
-        stage('Spot Poc Build') {
-            when {
-                anyOf { branch 'DOPS-2931' }
-            }
-            agent { label 'linux-docker' }
-            steps{
-                script {
-                   dockerBuildArgs = ['version':"${version}"]
                 }
-                dockerBuildMultiAccount(appName, env, version, ecrRepo, awsAccount, awsRegion, dockerBuildArgs)
             }
         }
-
-        stage('Spot Poc Deploy') {
-            when {
-                anyOf { branch 'DOPS-2931' }
-            }
-            agent { label 'linux-terraform' }
-            environment{
-                PATH = "$PATH:~/.tfenv"
-            }
+       
+        stage('Deploy Aws Ecr image into Aws EKS') {
             steps {
-                checkout([$class: 'GitSCM', branches: [[name: '*/DOPS-2931']], doGenerateSubmoduleConfigurations: false, extensions: [[$class: 'RelativeTargetDirectory', relativeTargetDir: '']], submoduleCfg: [], userRemoteConfigs: [[credentialsId: 'eq00svc-buildmaster-bitbucket-api-key', url: 'https://bitbucket.org/equinoxfitness/coaching-terraform']]])
-                writeFile file: "coaching-hypergate/assessment/spot/terraform.tfvars", text: """
-spot_poc_hypergate_assessment_version = "${version}"
-"""
-                sh "chmod +x terraform-run.sh"
-                sh "./terraform-run.sh -e coaching-hypergate/assessment/spot"
+                dir("ecs") {
+                    script {
+                        sh '''
+							terraform init
+							terraform plan
+							terraform apply
+       
+                           '''
+                    }
+                }
             }
         }
+       
+    }  
     }
-}
